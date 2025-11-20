@@ -213,7 +213,6 @@ impl Renderable for StatusIndicatorWidget {
         let elapsed_duration = self.elapsed_duration_at(now);
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
 
-        // Plain rendering: no borders or padding so the live cell is visually indistinguishable from terminal scrollback.
         let mut lines: Vec<Line> = Vec::with_capacity(1 + self.agent_rows.len());
         let mut top_spans = Vec::with_capacity(7);
         top_spans.push(spinner(Some(self.last_resume_at)));
@@ -244,7 +243,6 @@ impl Renderable for StatusIndicatorWidget {
         }
         lines.push(Line::from(top_spans));
 
-        let now = Instant::now();
         for row in &self.agent_rows {
             let mut spans = Vec::new();
             let depth = usize::from(row.depth);
