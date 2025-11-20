@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -145,6 +146,7 @@ struct RunningCommand {
 const RATE_LIMIT_WARNING_THRESHOLDS: [f64; 3] = [75.0, 90.0, 95.0];
 const NUDGE_MODEL_SLUG: &str = "gpt-5.1-codex-mini";
 const RATE_LIMIT_SWITCH_PROMPT_THRESHOLD: f64 = 90.0;
+const MAX_AGENT_NAME_GRAPHEMES: usize = 48;
 
 #[derive(Default)]
 struct RateLimitWarningState {
@@ -314,6 +316,7 @@ struct ActiveWorkerStatus {
     worker_model: String,
     status: DelegateWorkerStatusKind,
     updated_at: Instant,
+    display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,6 +363,11 @@ impl ParentKey {
     }
 }
 
+struct AgentHierarchyContext<'a> {
+    children: &'a HashMap<ParentKey, Vec<usize>>,
+    hide_display_names: &'a HashSet<String>,
+}
+
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
         Self {
@@ -403,6 +411,37 @@ fn worker_status_label(kind: DelegateAgentKind, status: DelegateWorkerStatusKind
         DelegateWorkerStatusKind::Failed => "failed",
     };
     format!("{prefix} {suffix}")
+}
+
+fn derive_delegate_display_name(
+    kind: DelegateAgentKind,
+    status: DelegateWorkerStatusKind,
+    message: &str,
+) -> Option<String> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let noun = match kind {
+        DelegateAgentKind::Worker => "worker",
+        DelegateAgentKind::Manager => "manager",
+    };
+    let prefix = match status {
+        DelegateWorkerStatusKind::Starting => Some(format!("Starting {noun} for ")),
+        DelegateWorkerStatusKind::Running => Some(format!("Resuming {noun} for ")),
+        _ => None,
+    }?;
+    let remainder = trimmed.strip_prefix(prefix.as_str())?.trim();
+    if remainder.is_empty() {
+        None
+    } else {
+        let truncated = truncate_text(remainder, MAX_AGENT_NAME_GRAPHEMES);
+        if truncated.is_empty() {
+            None
+        } else {
+            Some(truncated)
+        }
+    }
 }
 
 fn agent_kind_rank(kind: DelegateAgentKind) -> u8 {
@@ -454,12 +493,17 @@ impl ChatWidget {
             let parent_key = ParentKey::from_option(key.parent_worker_id.as_deref());
             children.entry(parent_key).or_default().push(idx);
         }
+        let hide_display_names = self.worker_ids_with_duplicate_names(&children);
+        let traversal_context = AgentHierarchyContext {
+            children: &children,
+            hide_display_names: &hide_display_names,
+        };
         let mut visited = vec![false; self.worker_statuses.len()];
         self.collect_agent_rows(
             &ParentKey::Root,
             depth_offset,
             0,
-            &children,
+            &traversal_context,
             &mut rows,
             &mut visited,
         );
@@ -470,13 +514,14 @@ impl ChatWidget {
                 }
                 if let Some((key, status)) = self.worker_statuses.get_index(idx) {
                     visited[idx] = true;
-                    rows.push(self.make_agent_status_entry(key, status, depth_offset));
+                    let hide = hide_display_names.contains(&key.worker_id);
+                    rows.push(self.make_agent_status_entry(key, status, depth_offset, hide));
                     let child_key = ParentKey::Id(key.worker_id.clone());
                     self.collect_agent_rows(
                         &child_key,
                         depth_offset,
                         1,
-                        &children,
+                        &traversal_context,
                         &mut rows,
                         &mut visited,
                     );
@@ -487,16 +532,41 @@ impl ChatWidget {
         self.bottom_pane.update_agent_hierarchy(top_role, rows);
     }
 
+    fn worker_ids_with_duplicate_names(
+        &self,
+        children: &HashMap<ParentKey, Vec<usize>>,
+    ) -> HashSet<String> {
+        let mut hidden = HashSet::new();
+        for (key, status) in self.worker_statuses.iter() {
+            let Some(parent_display) = status.display_name.as_deref() else {
+                continue;
+            };
+            let parent_key = ParentKey::Id(key.worker_id.clone());
+            let Some(child_indices) = children.get(&parent_key) else {
+                continue;
+            };
+            if child_indices.iter().any(|child_idx| {
+                self.worker_statuses
+                    .get_index(*child_idx)
+                    .and_then(|(_, child_status)| child_status.display_name.as_deref())
+                    == Some(parent_display)
+            }) {
+                hidden.insert(key.worker_id.clone());
+            }
+        }
+        hidden
+    }
+
     fn collect_agent_rows(
         &self,
         parent: &ParentKey,
         depth_offset: u16,
         relative_depth: u16,
-        children: &HashMap<ParentKey, Vec<usize>>,
+        context: &AgentHierarchyContext<'_>,
         rows: &mut Vec<AgentStatusEntry>,
         visited: &mut [bool],
     ) {
-        if let Some(indices) = children.get(parent) {
+        if let Some(indices) = context.children.get(parent) {
             for &idx in indices {
                 if visited[idx] {
                     continue;
@@ -504,13 +574,14 @@ impl ChatWidget {
                 if let Some((key, status)) = self.worker_statuses.get_index(idx) {
                     visited[idx] = true;
                     let depth = depth_offset.saturating_add(relative_depth);
-                    rows.push(self.make_agent_status_entry(key, status, depth));
+                    let hide = context.hide_display_names.contains(&key.worker_id);
+                    rows.push(self.make_agent_status_entry(key, status, depth, hide));
                     let child_key = ParentKey::Id(key.worker_id.clone());
                     self.collect_agent_rows(
                         &child_key,
                         depth_offset,
                         relative_depth + 1,
-                        children,
+                        context,
                         rows,
                         visited,
                     );
@@ -524,6 +595,7 @@ impl ChatWidget {
         key: &WorkerStatusKey,
         status: &ActiveWorkerStatus,
         depth: u16,
+        hide_display_name: bool,
     ) -> AgentStatusEntry {
         let row_role = match status.kind {
             DelegateAgentKind::Worker => AgentRole::Worker,
@@ -533,6 +605,11 @@ impl ChatWidget {
             role: row_role,
             worker_id: Some(key.worker_id.clone()),
             worker_model: Some(status.worker_model.clone()),
+            display_name: if hide_display_name {
+                None
+            } else {
+                status.display_name.clone()
+            },
             message: status.message.clone(),
             depth,
             status: status.status,
@@ -545,7 +622,7 @@ impl ChatWidget {
         parent_worker_id: &str,
         child_kind: DelegateAgentKind,
         child_worker_id: &str,
-        child_message: &str,
+        child_display_name: Option<String>,
     ) {
         if let Some((_, parent_status)) = self
             .worker_statuses
@@ -556,7 +633,12 @@ impl ChatWidget {
                 DelegateAgentKind::Worker => "Worker",
                 DelegateAgentKind::Manager => "Manager",
             };
-            let summary = format!("Delegating to {child_role} {child_worker_id}: {child_message}");
+            let summary = match child_display_name {
+                Some(name) => {
+                    format!("Delegating to {child_role} {name} ({child_worker_id})")
+                }
+                None => format!("Delegating to {child_role} {child_worker_id}"),
+            };
             parent_status.message = truncate_text(&summary, 64);
             parent_status.status = DelegateWorkerStatusKind::Running;
             parent_status.updated_at = Instant::now();
@@ -963,40 +1045,67 @@ impl ChatWidget {
             self.refresh_agent_status_view();
             return;
         }
-        let parent_worker_id_for_update = event.parent_worker_id.clone();
-        let worker_id_for_update = event.worker_id.clone();
-        let child_kind = event.agent_kind;
-        let mut label = event.message.trim().to_string();
+        let DelegateWorkerStatusEvent {
+            worker_id,
+            worker_model,
+            agent_kind,
+            parent_worker_id,
+            status: status_kind,
+            message,
+            display_name,
+        } = event;
+        let parent_worker_id_for_update = parent_worker_id.clone();
+        let worker_id_for_update = worker_id.clone();
+        let child_kind = agent_kind;
+        let mut label = message.trim().to_string();
         if label.is_empty() {
-            label = worker_status_label(event.agent_kind, event.status);
+            label = worker_status_label(agent_kind, status_kind);
         }
         let truncated = truncate_text(&label, 64);
-        let truncated_for_parent = truncated.clone();
-        let key = WorkerStatusKey::new(event.worker_id, event.agent_kind, event.parent_worker_id);
+        let provided_display_name = display_name.and_then(|name| {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(truncate_text(trimmed, MAX_AGENT_NAME_GRAPHEMES))
+            }
+        });
+        let display_name = provided_display_name
+            .or_else(|| derive_delegate_display_name(agent_kind, status_kind, label.as_str()));
+        let key = WorkerStatusKey::new(worker_id, agent_kind, parent_worker_id);
+        let lookup_key = key.clone();
         match self.worker_statuses.entry(key) {
             Entry::Occupied(mut entry) => {
                 let status = entry.get_mut();
                 status.message = truncated;
-                status.worker_model = event.worker_model;
-                status.status = event.status;
+                status.worker_model = worker_model.clone();
+                status.status = status_kind;
                 status.updated_at = Instant::now();
+                if let Some(name) = display_name {
+                    status.display_name = Some(name);
+                }
             }
             Entry::Vacant(entry) => {
                 entry.insert(ActiveWorkerStatus {
                     message: truncated,
-                    kind: event.agent_kind,
-                    worker_model: event.worker_model,
-                    status: event.status,
+                    kind: agent_kind,
+                    worker_model,
+                    status: status_kind,
                     updated_at: Instant::now(),
+                    display_name,
                 });
             }
         }
+        let child_display_name = self
+            .worker_statuses
+            .get(&lookup_key)
+            .and_then(|status| status.display_name.clone());
         if let Some(parent_worker_id) = parent_worker_id_for_update {
             self.update_parent_status_with_child(
                 &parent_worker_id,
                 child_kind,
                 &worker_id_for_update,
-                &truncated_for_parent,
+                child_display_name,
             );
         }
         self.refresh_agent_status_view();

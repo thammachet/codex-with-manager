@@ -51,6 +51,7 @@ pub(crate) struct AgentStatusEntry {
     pub(crate) role: AgentRole,
     pub(crate) worker_id: Option<String>,
     pub(crate) worker_model: Option<String>,
+    pub(crate) display_name: Option<String>,
     pub(crate) message: String,
     pub(crate) depth: u16,
     pub(crate) status: DelegateWorkerStatusKind,
@@ -264,13 +265,21 @@ impl Renderable for StatusIndicatorWidget {
             spans.push(status_span);
             spans.push(" ".into());
             spans.push(row.role.short_label().bold());
+            if let Some(display_name) = &row.display_name {
+                spans.push(" ".into());
+                spans.push(display_name.as_str().into());
+            }
             if let Some(worker_id) = &row.worker_id {
                 spans.push(" ".into());
-                spans.push(worker_id.as_str().dim());
-                if let Some(worker_model) = &row.worker_model {
-                    spans.push(" ".into());
-                    spans.push(format!("({worker_model})").dim());
+                if row.display_name.is_some() {
+                    spans.push(format!("({worker_id})").dim());
+                } else {
+                    spans.push(worker_id.as_str().dim());
                 }
+            }
+            if let Some(worker_model) = &row.worker_model {
+                spans.push(" ".into());
+                spans.push(format!("({worker_model})").dim());
             }
             spans.push(" ".into());
             spans.push("·".dim());

@@ -27,6 +27,7 @@ pub(crate) struct ManagedWorker {
     pub(crate) cancel_token: CancellationToken,
     semaphore: Arc<Semaphore>,
     closed: AtomicBool,
+    display_name: Mutex<Option<String>>,
 }
 
 impl ManagedWorker {
@@ -36,6 +37,7 @@ impl ManagedWorker {
         agent_kind: DelegateAgentKind,
         codex: Codex,
         cancel_token: CancellationToken,
+        display_name: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -45,6 +47,7 @@ impl ManagedWorker {
             cancel_token,
             semaphore: Arc::new(Semaphore::new(1)),
             closed: AtomicBool::new(false),
+            display_name: Mutex::new(display_name),
         }
     }
 
@@ -65,6 +68,14 @@ impl ManagedWorker {
         self.mark_closed();
         let _ = self.codex.submit(Op::Shutdown {}).await;
         self.cancel_token.cancel();
+    }
+
+    pub(crate) async fn display_name(&self) -> Option<String> {
+        self.display_name.lock().await.clone()
+    }
+
+    pub(crate) async fn set_display_name(&self, value: Option<String>) {
+        *self.display_name.lock().await = value;
     }
 }
 
@@ -228,6 +239,10 @@ impl ManagedWorkerRegistry {
 
     pub(crate) fn take_all(&mut self) -> Vec<Arc<ManagedWorker>> {
         self.workers.drain().map(|(_, worker)| worker).collect()
+    }
+
+    pub(crate) fn all(&self) -> Vec<Arc<ManagedWorker>> {
+        self.workers.values().cloned().collect()
     }
 }
 

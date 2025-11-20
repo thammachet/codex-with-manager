@@ -837,6 +837,20 @@ impl Session {
         }
     }
 
+    pub(crate) async fn active_worker_display_names(&self) -> Vec<String> {
+        let workers = {
+            let guard = self.managed_workers.lock().await;
+            guard.all()
+        };
+        let mut names = Vec::new();
+        for worker in workers {
+            if let Some(name) = worker.display_name().await {
+                names.push(name);
+            }
+        }
+        names
+    }
+
     pub(crate) async fn worker_has_pending_run(&self, worker_id: &str) -> bool {
         let guard = self.worker_runs.lock().await;
         guard.contains_key(worker_id)
@@ -1391,6 +1405,7 @@ impl Session {
         worker_model: impl Into<String>,
         agent_kind: DelegateAgentKind,
         status: DelegateWorkerStatusKind,
+        display_name: Option<String>,
         message: impl Into<String>,
     ) {
         let event = EventMsg::DelegateWorkerStatus(DelegateWorkerStatusEvent {
@@ -1400,6 +1415,7 @@ impl Session {
             parent_worker_id: None,
             status,
             message: message.into(),
+            display_name,
         });
         self.send_event(turn_context, event).await;
     }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -18,12 +19,16 @@ use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::AuthManager;
+use crate::codex::Codex;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex_delegate::run_codex_conversation_interactive;
+use crate::codex_delegate::run_codex_conversation_one_shot;
 use crate::function_tool::FunctionCallError;
 use crate::manager_workers::ManagedWorker;
 use crate::manager_workers::WorkerAction;
@@ -64,6 +69,8 @@ struct DelegateAgentArgs {
     context: Option<String>,
     #[serde(default)]
     persona: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
     #[serde(default, alias = "manager_model")]
     model: Option<String>,
     #[serde(default, alias = "manager_id")]
@@ -75,6 +82,243 @@ struct DelegateAgentArgs {
 }
 
 const WORKER_STATUS_MIN_INTERVAL: Duration = Duration::from_millis(750);
+
+const AUTO_DISPLAY_NAME_SYSTEM_PROMPT: &str = r#"You label Codex manager/worker delegations. Create short, vivid names that help humans skim a hierarchy. Stay under 48 characters, keep it to six words or fewer, and avoid IDs, emojis, or trailing punctuation. Highlight how this task differs from sibling work rather than restating the full objective. Return only the label—no commentary."#;
+const AUTO_DISPLAY_NAME_PROMPT_SECTION_LIMIT: usize = 480;
+const AUTO_DISPLAY_NAME_EXISTING_LIMIT: usize = 6;
+const AUTO_DISPLAY_NAME_MAX_CHARS: usize = 48;
+const AUTO_DISPLAY_NAME_TIMEOUT: Duration = Duration::from_secs(6);
+
+#[derive(Deserialize)]
+struct GeneratedDisplayNamePayload {
+    display_name: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn generate_delegate_display_name(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    auth_manager: Arc<AuthManager>,
+    agent_model: &str,
+    kind: DelegateAgentKind,
+    objective: &str,
+    context: Option<&str>,
+    persona: Option<&str>,
+) -> Option<String> {
+    let trimmed_objective = objective.trim();
+    if trimmed_objective.is_empty() {
+        return None;
+    }
+    let active_names = session.active_worker_display_names().await;
+    let prompt =
+        build_display_name_prompt(kind, trimmed_objective, context, persona, &active_names)?;
+
+    let mut config = (*turn.client.config()).clone();
+    config.model = agent_model.to_string();
+    config.ceo.enabled = false;
+    config.manager.enabled = false;
+    config.base_instructions = Some(AUTO_DISPLAY_NAME_SYSTEM_PROMPT.to_string());
+    config.developer_instructions = None;
+    config.user_instructions = None;
+    config.compact_prompt = None;
+    config.project_doc_max_bytes = 0;
+    config.project_doc_fallback_filenames.clear();
+
+    let cancel = CancellationToken::new();
+    let codex = match run_codex_conversation_one_shot(
+        config,
+        auth_manager,
+        vec![UserInput::Text { text: prompt }],
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        cancel,
+        None,
+        SubAgentSource::Other("delegate_display_name".to_string()),
+    )
+    .await
+    {
+        Ok(codex) => codex,
+        Err(err) => {
+            warn!("failed to start delegate display name generator: {err}");
+            return None;
+        }
+    };
+
+    collect_generated_display_name(codex).await
+}
+
+async fn collect_generated_display_name(codex: Codex) -> Option<String> {
+    loop {
+        match timeout(AUTO_DISPLAY_NAME_TIMEOUT, codex.next_event()).await {
+            Ok(Ok(event)) => match event.msg {
+                EventMsg::TaskComplete(task) => {
+                    if let Some(message) = task.last_agent_message {
+                        if let Some(name) = sanitize_generated_display_name(&message) {
+                            return Some(name);
+                        }
+                        warn!("display name generator returned an empty response");
+                        return None;
+                    }
+                    warn!("display name generator completed without a response");
+                    return None;
+                }
+                EventMsg::TurnAborted(aborted) => {
+                    warn!(
+                        reason = ?aborted.reason,
+                        "display name generator aborted unexpectedly"
+                    );
+                    return None;
+                }
+                _ => continue,
+            },
+            Ok(Err(err)) => {
+                warn!("display name generator event stream failed: {err}");
+                return None;
+            }
+            Err(_) => {
+                warn!("display name generator timed out waiting for completion");
+                return None;
+            }
+        }
+    }
+}
+
+fn build_display_name_prompt(
+    kind: DelegateAgentKind,
+    objective: &str,
+    context: Option<&str>,
+    persona: Option<&str>,
+    existing_names: &[String],
+) -> Option<String> {
+    if objective.trim().is_empty() {
+        return None;
+    }
+    let mut sections = Vec::new();
+    let role = match kind {
+        DelegateAgentKind::Worker => "worker",
+        DelegateAgentKind::Manager => "manager",
+    };
+    sections.push(format!(
+        "Name a {role} task so the UI hierarchy stays scannable. The label must explain what success looks like in a handful of words."
+    ));
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for name in existing_names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        if seen.insert(lower) {
+            deduped.push(trimmed.to_string());
+        }
+        if deduped.len() == AUTO_DISPLAY_NAME_EXISTING_LIMIT {
+            break;
+        }
+    }
+    if !deduped.is_empty() {
+        sections.push(format!(
+            "Avoid collisions with existing labels: {}",
+            deduped.join(", ")
+        ));
+    }
+
+    sections.push(format!(
+        "Objective summary:\n{}",
+        clip_prompt_section(objective)
+    ));
+
+    if let Some(ctx) = context.and_then(|ctx| {
+        let trimmed = ctx.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }) {
+        sections.push(format!("Relevant context:\n{}", clip_prompt_section(ctx)));
+    }
+
+    if let Some(persona) = persona.and_then(|persona| {
+        let trimmed = persona.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }) {
+        sections.push(format!(
+            "Persona/voice constraints:\n{}",
+            clip_prompt_section(persona)
+        ));
+    }
+
+    sections.push("Respond with a single line containing only the label.".to_string());
+    Some(sections.join("\n\n"))
+}
+
+fn clip_prompt_section(input: &str) -> String {
+    let trimmed = input.trim();
+    truncate_preview(trimmed, AUTO_DISPLAY_NAME_PROMPT_SECTION_LIMIT)
+}
+
+fn sanitize_generated_display_name(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    if let Some(from_json) = parse_json_display_name(raw) {
+        return cleanse_display_name(&from_json);
+    }
+    cleanse_display_name(raw)
+}
+
+fn parse_json_display_name(raw: &str) -> Option<String> {
+    if let Ok(payload) = serde_json::from_str::<GeneratedDisplayNamePayload>(raw) {
+        return Some(payload.display_name);
+    }
+    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}'))
+        && start < end
+        && let Some(slice) = raw.get(start..=end)
+        && let Ok(payload) = serde_json::from_str::<GeneratedDisplayNamePayload>(slice)
+    {
+        return Some(payload.display_name);
+    }
+    None
+}
+
+fn cleanse_display_name(text: &str) -> Option<String> {
+    let mut line = text.lines().next()?.trim().to_string();
+    if line.is_empty() {
+        return None;
+    }
+    line = line
+        .trim_start_matches(['-', '*', '"', '`', '•', '#'])
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return None;
+    }
+    if let Some((prefix, rest)) = line.split_once(':')
+        && prefix.split_whitespace().count() <= 3
+    {
+        line = rest.trim().to_string();
+    }
+    line = line
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`'))
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '-'))
+        .to_string();
+    let condensed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let condensed = condensed
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':'))
+        .trim()
+        .to_string();
+    if condensed.is_empty() {
+        return None;
+    }
+    Some(clamp_display_name(&condensed))
+}
+
+fn clamp_display_name(value: &str) -> String {
+    value
+        .chars()
+        .enumerate()
+        .take_while(|(idx, _)| *idx < AUTO_DISPLAY_NAME_MAX_CHARS)
+        .map(|(_, ch)| ch)
+        .collect()
+}
 
 fn append_persona_instructions(target: &mut Option<String>, persona: Option<&str>) {
     let Some(persona) = persona.map(str::trim).filter(|p| !p.is_empty()) else {
@@ -90,12 +334,19 @@ fn append_persona_instructions(target: &mut Option<String>, persona: Option<&str
     *target = Some(updated);
 }
 
+fn normalize_display_name(input: Option<String>) -> Option<String> {
+    input
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 struct WorkerStatusEmitter {
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     worker_id: String,
     worker_model: String,
     agent_kind: DelegateAgentKind,
+    display_name: Option<String>,
     last_status: Option<DelegateWorkerStatusKind>,
     last_message: Option<String>,
     last_emit_at: Option<Instant>,
@@ -108,6 +359,7 @@ impl WorkerStatusEmitter {
         worker_id: String,
         worker_model: String,
         agent_kind: DelegateAgentKind,
+        display_name: Option<String>,
     ) -> Self {
         Self {
             session,
@@ -115,6 +367,7 @@ impl WorkerStatusEmitter {
             worker_id,
             worker_model,
             agent_kind,
+            display_name,
             last_status: None,
             last_message: None,
             last_emit_at: None,
@@ -137,6 +390,7 @@ impl WorkerStatusEmitter {
                     self.worker_model.clone(),
                     self.agent_kind,
                     status,
+                    self.display_name.clone(),
                     trimmed.clone(),
                 )
                 .await;
@@ -521,7 +775,7 @@ async fn start_agent(
     let cancel = CancellationToken::new();
     let worker_codex = run_codex_conversation_interactive(
         agent_config,
-        auth_manager,
+        Arc::clone(&auth_manager),
         Arc::clone(&session),
         Arc::clone(&turn),
         cancel.clone(),
@@ -537,13 +791,38 @@ async fn start_agent(
     })?;
 
     let worker_id = session.allocate_worker_id(kind).await;
+    let mut initial_display_name = normalize_display_name(args.display_name.clone());
+    if initial_display_name.is_none() {
+        initial_display_name = generate_delegate_display_name(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            auth_manager,
+            agent_model.as_str(),
+            kind,
+            args.objective.as_deref().unwrap_or_default(),
+            args.context.as_deref(),
+            args.persona.as_deref(),
+        )
+        .await;
+    }
     let worker = Arc::new(ManagedWorker::new(
         worker_id.clone(),
         agent_model.clone(),
         kind,
         worker_codex,
         cancel,
+        initial_display_name.clone(),
     ));
+
+    let raw_display_name = args.display_name.clone();
+    let cleaned_provided = normalize_display_name(raw_display_name.clone());
+    if raw_display_name.is_some() {
+        worker.set_display_name(cleaned_provided.clone()).await;
+    }
+    let mut display_name = cleaned_provided.or(initial_display_name);
+    if display_name.is_none() {
+        display_name = worker.display_name().await;
+    }
 
     let objective = args.objective.clone().unwrap_or_default();
     let objective_preview = truncate_preview(&objective, 80);
@@ -561,6 +840,7 @@ async fn start_agent(
         worker_id.clone(),
         worker.model.clone(),
         kind,
+        display_name,
     );
     status_emitter
         .emit(
@@ -635,6 +915,36 @@ async fn resume_agent(
     }
 
     let objective = args.objective.clone().unwrap_or_default();
+    let raw_display_name = args.display_name.clone();
+    let cleaned_provided = normalize_display_name(raw_display_name.clone());
+    if raw_display_name.is_some() {
+        worker.set_display_name(cleaned_provided.clone()).await;
+    }
+    let mut display_name = cleaned_provided.or(worker.display_name().await);
+    if display_name.is_none() {
+        if let Some(auth_manager) = turn.client.get_auth_manager() {
+            let generated = generate_delegate_display_name(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                auth_manager,
+                worker.model.as_str(),
+                expected_kind,
+                objective.as_str(),
+                args.context.as_deref(),
+                args.persona.as_deref(),
+            )
+            .await;
+            if let Some(name) = &generated {
+                worker.set_display_name(Some(name.clone())).await;
+            }
+            display_name = generated;
+        } else {
+            warn!(
+                "missing auth manager when generating display name for {}",
+                worker_id
+            );
+        }
+    }
     let objective_preview = truncate_preview(&objective, 80);
     let input = build_worker_input(&objective, args.context.as_deref());
     let summary = Arc::new(Mutex::new(WorkerRunSummary::new(
@@ -650,6 +960,7 @@ async fn resume_agent(
         worker_id.clone(),
         worker.model.clone(),
         expected_kind,
+        display_name,
     );
     status_emitter
         .emit(
@@ -1153,5 +1464,23 @@ mod tests {
         let mut instructions = Some("Existing".to_string());
         append_persona_instructions(&mut instructions, Some("   \n"));
         assert_eq!(instructions.as_deref(), Some("Existing"));
+    }
+
+    #[test]
+    fn sanitize_display_name_from_json() {
+        let raw = r#"{"display_name":"Docs Polish"}"#;
+        assert_eq!(
+            sanitize_generated_display_name(raw).as_deref(),
+            Some("Docs Polish")
+        );
+    }
+
+    #[test]
+    fn sanitize_display_name_from_plain_text() {
+        let raw = "- Worker Label:  Fix parsing loop.\nAdditional commentary here.";
+        assert_eq!(
+            sanitize_generated_display_name(raw).as_deref(),
+            Some("Fix parsing loop")
+        );
     }
 }

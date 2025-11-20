@@ -1318,9 +1318,13 @@ pub struct DelegateWorkerStatusEvent {
     #[serde(default = "default_delegate_agent_kind")]
     pub agent_kind: DelegateAgentKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub parent_worker_id: Option<String>,
     pub status: DelegateWorkerStatusKind,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_name: Option<String>,
 }
 
 const fn default_delegate_agent_kind() -> DelegateAgentKind {
